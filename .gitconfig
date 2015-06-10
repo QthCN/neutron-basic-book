@@ -1,0 +1,27 @@
+[user]
+	name = Qin TianHuan
+    email = thuanqin@163.com
+[color]
+	ui = true
+[alias]
+    glog = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr)%Creset' --abbrev-commit --date=relative
+    co = checkout
+    br = branch
+    ci = commit
+    st = status
+[filter "media"]
+	required = true
+	clean = git media clean %f
+	smudge = git media smudge %f
+[filter "hawser"]
+	clean = git hawser clean %f
+	smudge = git hawser smudge %f
+	required = true
+[filter "lfs"]
+	clean = git lfs clean %f
+	smudge = git lfs smudge %f
+	required = true
+[push]
+	default = simple
+[oh-my-zsh]
+	hide-status = 1
