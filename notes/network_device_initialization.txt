@@ -1,0 +1,156 @@
+这篇文章会记录一下小秦学习到的Linux下网络设备的初始化的流程。主要是参考《Understanding Linux Network Internals》以及Linux的源代码。
+
+首先先看下kernel启动时候的流程：kernel在boot up的时候，会的从start_kernel开始执行相关的初始化工作，其会初始化一大堆的子系统。首先看下从start_kernel到net_dev_init的路径：
+
+[code lang='c']
+asmlinkage __visible void __init start_kernel(void)
+{
+    ......
+    init_IRQ();
+    ......
+    softirq_init();
+    ......
+    time_init();
+    ......
+    rest_init();
+}
+
+static noinline void __init_refok rest_init(void)
+{
+    ......
+    kernel_thread(kernel_init, NULL, CLONE_FS);
+    ......
+}
+
+static int __ref kernel_init(void *unused)
+{
+    ......
+    kernel_init_freeable();
+    ...... 
+}
+
+static noinline void __init kernel_init_freeable(void)
+{
+    ......
+    do_basic_setup();
+    ......
+}
+
+static void __init do_basic_setup(void)
+{
+    cpuset_init_smp();
+    usermodehelper_init();
+    shmem_init();
+    driver_init();
+    init_irq_proc();
+    do_ctors();
+    usermodehelper_enable();
+    do_initcalls();
+    random_int_secret_init();
+}
+
+static void __init do_initcalls(void)
+{
+    int level;
+
+    for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+        do_initcall_level(level);
+}
+
+//subsys_initcall(net_dev_init)会的注册net_dev_init，所以其中的一个level会的执行net_dev_init。
+
+[/code]
+
+在linux中，一个网络设备是以一个net_device存在的。最简单的例子，对于一个硬件的物理网卡，其在系统启动的时候会的被驱动识别并在内核中建立net_deivce数据结构。所以当我们用ip link show命令查看的时候，我们可以查看到这些net_device设备，一般就是eth0、eth1这类。
+
+当一个物理网卡要向kernel发出请求告知某个事件发生的时候，其会通过中断来通知kernel。每个NIC都会被分配一个中断号，通过中断寄存器kernel可以根据中断号找到具体要执行的handle，这个handle会去NIC上处理相应的事件。中断号和handle通过下面的两个函数绑定和解绑：
+[code lang='c']
+static inline int __must_check
+request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,
+        const char *name, void *dev)
+
+void free_irq(unsigned int irq, void *dev_id)
+[/code]
+
+request_irq将一个irq和handler进行关联，free_irq则解除这种关联。一个NIC在下面几种情况下会发出中断：
+1.收到了一个frame
+2.一个frame发出去的时候失败了
+3.DMA传输成功
+4.NIC现在有足够内存继续发送frame
+
+对应的数据结构为：
+[code lang='c']
+/**
+ * struct irqaction - per interrupt action descriptor
+ * @handler:    interrupt handler function
+ * @name:   name of the device
+ * @dev_id: cookie to identify the device
+ * @percpu_dev_id:  cookie to identify the device
+ * @next:   pointer to the next irqaction for shared interrupts
+ * @irq:    interrupt number
+ * @flags:  flags (see IRQF_* above)
+ * @thread_fn:  interrupt handler function for threaded interrupts
+ * @thread: thread pointer for threaded interrupts
+ * @thread_flags:   flags related to @thread
+ * @thread_mask:    bitmask for keeping track of @thread activity
+ * @dir:    pointer to the proc/irq/NN/name entry
+ */
+struct irqaction {
+    irq_handler_t       handler;
+    void            *dev_id;
+    void __percpu       *percpu_dev_id;
+    struct irqaction    *next;
+    irq_handler_t       thread_fn;
+    struct task_struct  *thread;
+    unsigned int        irq;
+    unsigned int        flags;
+    unsigned long       thread_flags;
+    unsigned long       thread_mask;
+    const char      *name;
+    struct proc_dir_entry   *dir;
+} ____cacheline_internodealigned_in_smp;
+[/code]
+
+这里的dev_id对于网络设备来说就是net_device，net_device是由驱动初始化的，因此当一个中断发生的时候，handler就能找到对应的net_device，并执行驱动的相关函数。next用于多个设备共享IRQ的情况，用于指向下一个irqaction。name就是我们在/proc/interrupts中看到的名字。
+
+除此之外现在的网卡一般都是走PCIe的，因此驱动会调用PCIe的相关接口进行注册。流程一般是这样的：
+1.系统启动，PCI总线进行设备发现，得到使用这个总线的设备
+2.每个PCI设备根据PCI的标准都是可以从其得到一个唯一的ID（PCI ID）的
+3.当一个网卡驱动加载的时候，其可以调用如下的方法在PCI中注册自己：
+[code lang='c']
+static int __init e100_init_module(void) 
+{
+    return pci_module_init(&e100_driver);
+}
+[/code]
+这里的e100_driver为：
+[code lang='c']
+static struct pci_driver e100_driver = {
+     .name = DRV_NAME,
+     .id_table = e100_id_table, 
+     .probe = e100_probe,
+     .remove = __devexit_p(e100_remove),
+#ifdef CONFIG_PM
+     .suspend = e100_suspend,
+     .resume = e100_resume,
+#endif
+};
+[/code]
+其中e100_id_table里写明了这个驱动支持那些设备，里边包含的是其支持的设备的PCI ID。
+4.PCI发现有一个新设备的时候，依次调用pci_driver，分别将这个设备的PCI ID与每个pci_driver的id_table比较，查看是否有支持的驱动注册了，如果有的话就调用probe方法，后者由驱动实现。
+5.驱动的probe方法会的生成对应的net_device以及进行注册中断等操作，这个就和普通的一样了
+
+所以对于PCI总线来说其有两个重要的链表，一个是device的，一个是driver的。
+
+
+
+
+
+
+
+
+
+
+
+
+

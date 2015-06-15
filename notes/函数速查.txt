@@ -1,0 +1,21 @@
+函数：
+request_irq:    注册中断
+free_irq:   解绑注册的中断
+request_region: 注册IO到内存的映射
+release_region: 解绑IO到内存的映射
+net_dev_init:   系统启动阶段负责初始化network子系统
+pci_register_driver:    驱动程序调用，用于将其注册一个pci_driver在相应的PCI的链表上
+pci_unregister_driver:  移除pci_driver
+pci_module_init:    对pci_register_driver的一个封装，功能类似
+
+
+全局变量：
+irq_desc:   指向IRQ描述符表
+
+数据结构：
+irq_action: 存放IRQ和handle等其余相关中断处理需要的信息，依附在irq_desc上
+net_device: 网络设备数据结构
+pci_dev:    每个PCI设备在内核中的数据结构，类似于net_device
+pci_driver: 驱动程序实现的用于PCI设备的驱动，提供probe、remove、id_table等属性。probe会建立对应的net_device结构
+pci_device_id:  PCI设备的唯一公开ID。PCI总线根据连在其上面的设备的pci_device_id依次遍历注册的pci_driver的id_table，发现ID符合的pci_driver后调用其probe方法注册设备
+pci_dev:    代表一个PCI设备
