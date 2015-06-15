@@ -113,7 +113,7 @@ struct irqaction {
 
 这里的dev_id对于网络设备来说就是net_device，net_device是由驱动初始化的，因此当一个中断发生的时候，handler就能找到对应的net_device，并执行驱动的相关函数。next用于多个设备共享IRQ的情况，用于指向下一个irqaction。name就是我们在/proc/interrupts中看到的名字。
 
-除此之外现在的网卡一般都是走PCIe的，因此驱动会调用PCIe的相关接口进行注册。流程一般是这样的：
+上面讲了中断，那么request_irq是被谁调用的呢？现在的网卡一般都是走PCIe的，因此驱动会调用PCIe的相关接口进行注册。流程一般是这样的：
 1.系统启动，PCI总线进行设备发现，得到使用这个总线的设备
 2.每个PCI设备根据PCI的标准都是可以从其得到一个唯一的ID（PCI ID）的
 3.当一个网卡驱动加载的时候，其可以调用如下的方法在PCI中注册自己：
@@ -138,13 +138,11 @@ static struct pci_driver e100_driver = {
 [/code]
 其中e100_id_table里写明了这个驱动支持那些设备，里边包含的是其支持的设备的PCI ID。
 4.PCI发现有一个新设备的时候，依次调用pci_driver，分别将这个设备的PCI ID与每个pci_driver的id_table比较，查看是否有支持的驱动注册了，如果有的话就调用probe方法，后者由驱动实现。
-5.驱动的probe方法会的生成对应的net_device以及进行注册中断等操作，这个就和普通的一样了
+5.驱动的probe方法会的生成对应的net_device以及进行注册中断等操作，这里会发生调用request_irq的事件
 
 所以对于PCI总线来说其有两个重要的链表，一个是device的，一个是driver的。
 
-
-
-
+上面的这个流程应该是我们看代码的一个入口。
 
 
 
