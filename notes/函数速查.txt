@@ -7,6 +7,17 @@ net_dev_init:   系统启动阶段负责初始化network子系统
 pci_register_driver:    驱动程序调用，用于将其注册一个pci_driver在相应的PCI的链表上
 pci_unregister_driver:  移除pci_driver
 pci_module_init:    对pci_register_driver的一个封装，功能类似
+module_init:    注册一个module，一般是注册驱动
+module_exit:    移除一个module，一般是卸载驱动
+init_module:    module提供，用于被module_init调用
+cleanup_module: module提供，用于被module_exit调用
+alloc_netdev:   分配一个net_device数据结构。这个数据结构需要由驱动去初始化。调用的时候需要提供private data大小、dev的名字（一般是eth%d）以及setup routine。setup routine能对net_device做基本的初始化
+dev_alloc_name: 用于生成alloc_netdev名字参数需要的%d
+alloc_etherdev: 对alloc_netdev的封装，专门用于产生以太网设备的net_device。比如其传递的dev名字、setup routine都是以太网相关的。实现为：return alloc_netdev(sizeof_priv, "eth%d", ether_setup)
+register_netdevice: 将一个net_device注册到数据库（链表）中。会调用net_device的init函数
+netdev_run_todo:    register_netdevice只会做简单的事情，大部分注册相关的事情由netdev_run_todo完成
+netdev_priv:    获取private data的头部指针
+
 
 
 全局变量：

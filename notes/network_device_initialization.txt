@@ -1,6 +1,6 @@
-这篇文章会记录一下小秦学习到的Linux下网络设备的初始化的流程。主要是参考《Understanding Linux Network Internals》以及Linux的源代码。
+这篇文章会说下net_device的生产过程。
 
-首先先看下kernel启动时候的流程：kernel在boot up的时候，会的从start_kernel开始执行相关的初始化工作，其会初始化一大堆的子系统。首先看下从start_kernel到net_dev_init的路径：
+首先看下kernel启动时候的流程：kernel在boot up的时候，会的从start_kernel开始执行相关的初始化工作，其会初始化一大堆的子系统。首先看下从start_kernel到net_dev_init的路径：
 
 [code lang='c']
 asmlinkage __visible void __init start_kernel(void)
@@ -138,17 +138,269 @@ static struct pci_driver e100_driver = {
 [/code]
 其中e100_id_table里写明了这个驱动支持那些设备，里边包含的是其支持的设备的PCI ID。
 4.PCI发现有一个新设备的时候，依次调用pci_driver，分别将这个设备的PCI ID与每个pci_driver的id_table比较，查看是否有支持的驱动注册了，如果有的话就调用probe方法，后者由驱动实现。
-5.驱动的probe方法会的生成对应的net_device以及进行注册中断等操作，这里会发生调用request_irq的事件
+5.驱动的probe方法会的生成对应的net_device以及进行注册中断等操作，这里会发生调用request_irq的事件。同时probe会对net_device做初始化，net_device的各种函数指针属性会在这里得到赋值。具体的可以见下文。
 
-所以对于PCI总线来说其有两个重要的链表，一个是device的，一个是driver的。
+对于PCI总线来说其有两个重要的链表，一个是device的，一个是driver的。
 
 上面的这个流程应该是我们看代码的一个入口。
 
+来看下probe会做什么事情吧。在probe中，主要会做这些事情：
+* 调用alloc_etherdev（alloc_netdev的一个wrapper），分配一个以太网的net_device，alloc_etherdev会调用ether_setup对net_device做基本的初始化。alloc_etherdev会的传递以太网的private data大小给alloc_netdev，所以此时的net_device包含了通用大小+private data大小+padding大小
+* 某些驱动会对net_device调用netdev_boot_setup_check，kernel启动的时候的相关参数
+* 调用register_netdevice注册这个net_device。register_netdevice会调用net_device的init函数指针，init这个函数一般用于初始化private data。
 
+可以看到第一步中以及对net_device调用ether_setup执行了以太网设备的基本的初始化。对于net_device来说，初始化主要来自于下面几个方面：
+1.驱动
+2.XXX_setup，比如ether_setup。每种网络类型都会有自己的XXX_setup
+3.高级特性。比如QoS等系统会对net_device做初始化
 
+在probe中，驱动是在alloc_etherdev调用分配得到net_device后才开始执行驱动对net_device的初始化的，所以其可以覆盖XXX_setup的一些初始化内容。下面是xxx_setup以及驱动一般分别会初始化的net_device的部分属性（比如函数指针）：
 
+xxx_setup:
+change_mtu
+set_mac_address
+rebuild_header
+hard_header
+hard_header_cache
+header_cache_update
+hard_header_parse
+type
+hard_header_len
+mtu
+addr_len
+tx_queue_len
+broadcast
+flags
 
+驱动:
+open
+stop
+hard_start_xmit
+tx_timeout
+watchdog_timeo
+get_stats
+get_wireless_stats
+set_multicast_list
+do_ioctl
+init
+uninit
+poll
+ethtool_ops
+bash_addr
+irq
+if_port
+priv
+features
 
+我们来看一个实际例子，看的驱动为interl的e1000，路径为：drivers/net/ethernet/intel/e1000。
 
+首先我们来找注册pci driver的地方：
+[code lang='c']
+static struct pci_driver e1000_driver = {
+    .name     = e1000_driver_name,
+    .id_table = e1000_pci_tbl,
+    .probe    = e1000_probe,
+    .remove   = e1000_remove,
+#ifdef CONFIG_PM
+    /* Power Management Hooks */
+    .suspend  = e1000_suspend,
+    .resume   = e1000_resume,
+#endif
+    .shutdown = e1000_shutdown,
+    .err_handler = &e1000_err_handler
+};
+[/code]
 
+来重点看下e1000_probe，按照我们上面了解到的，它应该会注册IRQ，生成net_device，初始化net_device以及注册net_device。代码如下：
+[code lang='c']
+static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+{
+    struct net_device *netdev;
+    struct e1000_adapter *adapter;
+    struct e1000_hw *hw;
 
+    static int cards_found = 0;
+    static int global_quad_port_a = 0; /* global ksp3 port a indication */
+    int i, err, pci_using_dac;
+    u16 eeprom_data = 0;
+    u16 tmp = 0;
+    u16 eeprom_apme_mask = E1000_EEPROM_APME;
+    int bars, need_ioport;
+[/code]
+一些变量的声明，接着：
+[code lang='c']
+    /* do not allocate ioport bars when not needed */
+    need_ioport = e1000_is_need_ioport(pdev);
+    if (need_ioport) {
+        bars = pci_select_bars(pdev, IORESOURCE_MEM | IORESOURCE_IO);
+        err = pci_enable_device(pdev);
+    } else {
+        bars = pci_select_bars(pdev, IORESOURCE_MEM);
+        err = pci_enable_device_mem(pdev);
+    }
+    if (err)
+        return err;
+
+    err = pci_request_selected_regions(pdev, bars, e1000_driver_name);
+    if (err)
+        goto err_pci_reg;
+
+    pci_set_master(pdev);
+    err = pci_save_state(pdev);
+    if (err)
+        goto err_alloc_etherdev;
+[/code]
+这些是pci相关的，不清楚是干嘛的，不过下面的代码就熟悉了：
+[code lang='c']
+    err = -ENOMEM;
+    netdev = alloc_etherdev(sizeof(struct e1000_adapter));
+    if (!netdev)
+        goto err_alloc_etherdev;
+[/code]
+这里分配了一个net_device，并且private data为一个e1000_adapter结构体的长度。继续看代码：
+[code lang='c']
+SET_NETDEV_DEV(netdev, &pdev->dev);
+[/code]
+其实现为：
+[code lang='c']
+#define SET_NETDEV_DEV(net, pdev)   ((net)->dev.parent = (pdev))
+[/code]
+也就是设置parent为pdev。继续看代码：
+[code lang='c']
+    pci_set_drvdata(pdev, netdev);
+    adapter = netdev_priv(netdev);
+    adapter->netdev = netdev;
+    adapter->pdev = pdev;
+    adapter->msg_enable = netif_msg_init(debug, DEFAULT_MSG_ENABLE);
+    adapter->bars = bars;
+    adapter->need_ioport = need_ioport;
+
+    hw = &adapter->hw;
+    hw->back = adapter;
+[/code]
+pci_set_drvdata是给pdev一个net_device属性赋值。重点看下下面的几行，其中netdev_priv会获取到net_device中指向private data头部的指针，也就是一个e1000_adapter结构体。所以这边做的事情其实就是初始化我们的private data。
+
+继续看代码：
+[code lang='c']
+    err = -EIO;
+    hw->hw_addr = pci_ioremap_bar(pdev, BAR_0);
+    if (!hw->hw_addr)
+        goto err_ioremap;
+
+    if (adapter->need_ioport) {
+        for (i = BAR_1; i <= BAR_5; i++) {
+            if (pci_resource_len(pdev, i) == 0)
+                continue;
+            if (pci_resource_flags(pdev, i) & IORESOURCE_IO) {
+                hw->io_base = pci_resource_start(pdev, i);
+                break;
+            }
+        }
+    }
+[/code]
+这里还是不清楚是干嘛的，但是和我们本文的目的关系应该不大，所以先忽略。从这里开始往下可以看到很多的代码都是初始化adapter这个私有结构体的，这些我们都跳过，接着看：
+[code lang='c']
+    netdev->netdev_ops = &e1000_netdev_ops;
+    e1000_set_ethtool_ops(netdev);
+    netdev->watchdog_timeo = 5 * HZ;
+    netif_napi_add(netdev, &adapter->napi, e1000_clean, 64);
+
+    strncpy(netdev->name, pci_name(pdev), sizeof(netdev->name) - 1);
+[/code]
+很熟悉吧。e1000_netdev_ops就是这个net_device的很多的函数指针，包括：
+[code lang='c']
+static const struct net_device_ops e1000_netdev_ops = {
+    .ndo_open       = e1000_open,
+    .ndo_stop       = e1000_close,
+    .ndo_start_xmit     = e1000_xmit_frame,
+    .ndo_get_stats      = e1000_get_stats,
+    .ndo_set_rx_mode    = e1000_set_rx_mode,
+    .ndo_set_mac_address    = e1000_set_mac,
+    .ndo_tx_timeout     = e1000_tx_timeout,
+    .ndo_change_mtu     = e1000_change_mtu,
+    .ndo_do_ioctl       = e1000_ioctl,
+    .ndo_validate_addr  = eth_validate_addr,
+    .ndo_vlan_rx_add_vid    = e1000_vlan_rx_add_vid,
+    .ndo_vlan_rx_kill_vid   = e1000_vlan_rx_kill_vid,
+#ifdef CONFIG_NET_POLL_CONTROLLER
+    .ndo_poll_controller    = e1000_netpoll,
+#endif
+    .ndo_fix_features   = e1000_fix_features,
+    .ndo_set_features   = e1000_set_features,
+};
+[/code]
+e1000_set_ethtool_ops则是初始化ethtool的函数指针，包括：
+[code lang='c']
+static const struct ethtool_ops e1000_ethtool_ops = {
+    .get_settings       = e1000_get_settings,
+    .set_settings       = e1000_set_settings, 
+    .get_drvinfo        = e1000_get_drvinfo,
+    .get_regs_len       = e1000_get_regs_len,
+    .get_regs       = e1000_get_regs,
+    .get_wol        = e1000_get_wol,
+    .set_wol        = e1000_set_wol,
+    .get_msglevel       = e1000_get_msglevel,
+    .set_msglevel       = e1000_set_msglevel,
+    .nway_reset     = e1000_nway_reset,
+    .get_link       = e1000_get_link,
+    .get_eeprom_len     = e1000_get_eeprom_len,
+    .get_eeprom     = e1000_get_eeprom,
+    .set_eeprom     = e1000_set_eeprom,
+    .get_ringparam      = e1000_get_ringparam,
+    .set_ringparam      = e1000_set_ringparam,
+    .get_pauseparam     = e1000_get_pauseparam,
+    .set_pauseparam     = e1000_set_pauseparam,
+    .self_test      = e1000_diag_test,
+    .get_strings        = e1000_get_strings,
+    .set_phys_id        = e1000_set_phys_id,
+    .get_ethtool_stats  = e1000_get_ethtool_stats,
+    .get_sset_count     = e1000_get_sset_count,
+    .get_coalesce       = e1000_get_coalesce,
+    .set_coalesce       = e1000_set_coalesce,
+    .get_ts_info        = ethtool_op_get_ts_info,
+};
+    
+void e1000_set_ethtool_ops(struct net_device *netdev)
+{       
+    netdev->ethtool_ops = &e1000_ethtool_ops;
+} 
+[/code]
+netif_napi_add的我们不看，只是先记下在probe中会调用这个方法。继续往下的代码很多又是关于私有数据结构adapter的，和我们上文有关的代码为：
+[code lang='c']
+    strcpy(netdev->name, "eth%d");
+    err = register_netdev(netdev);
+    if (err)
+        goto err_register;
+[/code]
+终于我们的net_device注册上去了。可以看到register_netdev就是一个wrapper：
+[code lang='c']
+int register_netdev(struct net_device *dev)
+{   
+    int err;
+        
+    rtnl_lock();
+    err = register_netdevice(dev);
+    rtnl_unlock();
+    return err;
+}   
+EXPORT_SYMBOL(register_netdev);
+[/code]
+
+看到这里有个疑问，我们的irq是什么时候和handle绑定的？简单的搜了下request_irq后可以发现，在e1000_open中会进行中断的绑定：
+[code lang='c']
+static int e1000_request_irq(struct e1000_adapter *adapter)
+{
+    struct net_device *netdev = adapter->netdev;
+    irq_handler_t handler = e1000_intr;
+    int irq_flags = IRQF_SHARED;
+    int err; 
+
+    err = request_irq(adapter->pdev->irq, handler, irq_flags, netdev->name,
+                      netdev);
+    if (err) {
+        e_err(probe, "Unable to allocate interrupt Error: %d\n", err);
+    }    
+
+    return err; 
+}
+[/code]
