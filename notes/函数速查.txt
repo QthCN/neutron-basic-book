@@ -17,6 +17,20 @@ alloc_etherdev: 对alloc_netdev的封装，专门用于产生以太网设备的n
 register_netdevice: 将一个net_device注册到数据库（链表）中。会调用net_device的init函数
 netdev_run_todo:    register_netdevice只会做简单的事情，大部分注册相关的事情由netdev_run_todo完成
 netdev_priv:    获取private data的头部指针
+in_interrupt:   判断此CPU此时是否运行在中断中，包括硬件中断和软件中断
+in_softirq: 判断此CPU此时是否在处理softirq
+in_irq: 判断此CPU此时是否在处理硬件中断
+softirq_pending:    判断某个CPU是否有需要处理的软中断
+local_softirq_pending:  判断此CPU是否要要处理的软中断
+preempt_disable:    对当前task停止抢占
+preempt_enable_no_resched:  对是否允许抢占的计数器减一，当减为0的时候就允许抢占
+preempt_enable: 对是否允许抢占的计数器减一，当减为0的时候就允许抢占。并且其会判断是否已经为0，如果是的话主动调用schedule()交出时间片
+do_bottom_half: 开始准备执行下半区
+run_bottom_half:    执行下半区。会检查哪些flag被标记了，然后找到其注册的下半区handler，然后执行它
+net_rx_action:  接受包的软中断handler
+net_tx_action:  发送包的软中断handler
+__do_softirq:   处理软中断的函数，会遍历pending的软中断，调用对应的handler（比如net_rx_action、net_tx_action）
+
 
 
 
