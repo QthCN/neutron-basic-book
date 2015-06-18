@@ -1,17 +1,17 @@
-这里来讲下数据包的接收流程，也就是一个数据包到达网卡后如何传到IP层或走bridge之前的那段过程。首先，我们先来看下中断。
+这里来讲下softirq与ksoftirqd。本文可以看成是对《Understanding Linux Network Internals》的学习笔记。
 
 中断，简单的说就是外部设备通知kernel的一种方式。在之前的文章里也介绍了，可以通过request irq的方法注册一个中断号以及对应的irq。当一个数据包到达网卡的时候，网卡就会触发对应的中断号，然后内核根据这个中断号找到对应的handle，由handler对这个数据包进行处理。
 
 注意，当中断的handler在进行处理的时候，中断是被关闭的。也就是说在handler执行期间，新的中断是不会被接收的。因此中断的handler只适合做一些非常快速的活，否则会阻塞其它中断的进行。那么对于网络协议来说要对其进行二层、三层等处理是很复杂很耗时的，但有时候数据包又会很多，咋办呢？于是内核里有下半区中断的说法。其实很简单，在handler里我只做最简单的操作，并在内存里保存足够的信息，然后设置一个flag说：“hi 内核，有空的时候来处理下我这边的事情哈”，然后handler就结束了。之后当内核空闲的时候，其会去检查有没有flag被标记为有事情要做，如果有的话内核就会去进行处理。
 
-下面会介绍下三种下半区的方法：
+目前主要有三种下半区的方法：
 1.old-style bottom half：即便是多核处理器，同一时间只能运行一种下半区任务
 2.tasklet：对于多核处理器，同一时间多个核可以同时运行不同种类的下半区任务，但是对于同一种类的下半区任务不能同时运行
 3.softirq：对于多核处理器，同一时间多个和可以同时运行多个下半区任务，并且任务的种类可以相同。不过同一时间相同的核上不能运行相同的任务
 
 下面主要介绍softirq。
 
-现在来看下handler和下半区（下面会简称BH）的联系。在内核boot的时候，start_kernel是被调用的入口：
+来看下handler和下半区（下面会简称BH）的联系。在内核boot up的时候，start_kernel是被调用的入口：
 [code lang='c']
 asmlinkage __visible void __init start_kernel(void)
 {
@@ -70,7 +70,7 @@ static void __init do_initcalls(void)
 //subsys_initcall(net_dev_init)会的注册net_dev_init，所以其中的一个level会的执行net_dev_init。
 
 [/code]
-可以看到，start_kernel会调用net_dev_init，我们的BH就是在这里绑定BH的处理handler的。来看下softqir的BH种类吧：
+可以看到，start_kernel会调用net_dev_init，我们的BH就是在这里绑定BH的处理handler的(至少网络部分是在这里)。来看下softqir的BH种类吧：
 [code lang='c']
 enum {
          HI_SOFTIRQ=0,
@@ -230,6 +230,8 @@ static void run_ksoftirqd(unsigned int cpu)
 }
 [/code]
 嘿嘿，其也就是调用了下__do_softirq()，只不过实在内核线程中执行罢了。注意，__do_softirq可是会disable BH的，所以如果软中断很高的话，BH就都会由这个内核线程处理而不是由其它地方（如上面中断后调用的do_softirq）进行处理。
+
+另外这里来看下多核处理器时的一些优化方法。如果是单队列的网卡，那么如何发挥多核的优势呢？根据我们已经学习到的，当一个数据包到达的时候，网卡注册中断所在的CPU会的响应中断，相关的数据在上半部会存放到CPU的softnet_data中，同时这个CPU的softirq的相关pending标记位会的被标记。现在问题来了，这样的话所有的下半部的压力就都压在这个CPU上了，有没有办法可以分散这些压力呢？比如虽然是这个CPU响应中断和处理上半部，但是能不能说把softirq分散到其它CPU进行处理呢？有的，这个我们以后会看到。
 
 ok，现在开始看下网络部分的softirq，关联的handler为：
 [code lang='c']
