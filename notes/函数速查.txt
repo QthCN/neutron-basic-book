@@ -27,10 +27,16 @@ preempt_enable_no_resched:  对是否允许抢占的计数器减一，当减为0
 preempt_enable: 对是否允许抢占的计数器减一，当减为0的时候就允许抢占。并且其会判断是否已经为0，如果是的话主动调用schedule()交出时间片
 do_bottom_half: 开始准备执行下半区
 run_bottom_half:    执行下半区。会检查哪些flag被标记了，然后找到其注册的下半区handler，然后执行它
-net_rx_action:  接受包的软中断handler
+net_rx_action:  接受包的软中断handler，遍历poll_list中的net_device，调用其poll方法。对于老的驱动poll方法由内核提供，对于NAPI则由驱动自己提供
 net_tx_action:  发送包的软中断handler
 __do_softirq:   处理软中断的函数，会遍历pending的软中断，调用对应的handler（比如net_rx_action、net_tx_action）
-
+netif_running:  检查__LINK_STATE_STAR是否设置
+netif_rx:   non-NAPI用于进一步处理二层包的入口方法，老的驱动通过这个函数将数据包放到softnet_data的input_pkt_queue尾部，同时将backuplog_dev放到poll_list中等待下半区处理。
+netif_rx_schedule/__netif_rx_schedule：将net_device放到poll_list中。对于NAPI在中断handler中会调用这个方法，对于non-NAPI则是由netif_rx调用，netif_rx中会的调用这个方法
+netif_rx_complete/__netif_rx_complete：poll_list中的net_device在poll处理后，如果没有数据包了则调用这个方法
+netif_poll_disable/netif_poll_enable：net_device在被加入到poll_list之前，会检查__LINK_STATE_RX_SCHED这个flag是否设置，如果设置了则认为已经在poll_list中了，则不会再次添加。引入如果想disable一个net_device，可以直接设置则个flag，从此其就不会被放入到poll_list中，于是其收到的包也就一直在设备内存中，不会被内核处理
+process_backlog：non-NAPI默认的poll方法
+netif_receive_skb：poll方法中，让数据包开始协议栈处理的入口函数。无论是non-NAPI还是NAPI都是通过这个函数传递sk_buff，然后通过协议栈处理这个sk_buff的。
 
 
 
