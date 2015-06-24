@@ -15,6 +15,7 @@
 2.3.调用设备的dev->hard_start_xmit进行发送
 2.4.如果dev->hard_start_xmit返回NETDEV_TX_OK则发送成功，成功的时候不会立刻free sk_buff，而是让下半区来进行free操作
 2.5.如果dev->hard_start_xmit没有返回NETDEV_TX_OK，则数据包会走类似2.1中失败的逻辑，等待软中断进行处理
+3.软中断的实际处理函数也是qdisc_run
 
 下面来看下对于发包，软中断做了什么，主要是两件事情：
 1.如果因为某种原因当前不能立刻发送这个包，则调用__netif_schedule/netif_schedule，后者会将这个net_device放到output_queue中等待软中断来发送数据包，并且同时也会将这个数据包重新requeue到qdisc的队列中
