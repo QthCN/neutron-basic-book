@@ -1,0 +1,89 @@
+这里来讲下发包。本文可以看成是对《Understanding Linux Network Internals》的学习笔记。
+
+首先来做个比较，在收包和发包之间做个比较：
+1.NET_TX_SOFTIRQ对应NET_RX_SOFTIRQ
+2.poll_list对应output_queue，一个用于接收包的device的list，一个是发送包的device的list，都是softnet_data的属性
+3.只有__LINK_STATE_START被设置的net_device可以收取数据包，只有__LINK_STATE_XOFF没有设置的net_device可以发送数据包
+4.当一个net_device被选为准备接收包的时候，其__LINK_STATE_RX_SCHED被设置。当一个net_device被选为准备发送数据包的时候，其__LINK_STATE_SCHED被设置
+5.发送包的dev_queue_xmit类似于接收包的netif_rx，后者对于non-NAPI会将数据库放置到kernel的接收queue中，而前者则是放到device的发送queue中
+
+下面来讲下发包的一些细节，如果理解了收包，那么理解发包就不难了。首先，发包的入口是dev_queue_xmit，其会做下面的事情：
+1.将数据包调用net_device的qdisc的enqueue方法，加入到qdisc的队列中（qdisc可以参考小秦博客里的文章，搜下tc）
+2.调用qdisc_run，其会有一个while循环调用qdisc_restart执行发送逻辑，逻辑如下：
+2.1.从net_device的qdisc处获取qdisc，执行qdisc的dequeue方法获取数据包（数据包的enqueue参见第一步）。如果成功的话会的获取到dev->queue_lock以及dev->xmit_lock这两个lock，然后执行下面的发送操作。如果失败则执行netif_schedule将这个设备放到output_queue中并调用qdisc的requeue将数据包放回发送队列，等待软中断进行发送。软中断会在这个设备可用的时候发送数据包
+2.2.如果存在protocol sniffers，则调用netdev_nit对每个sniffers让其对数据包做出操作
+2.3.调用设备的dev->hard_start_xmit进行发送
+2.4.如果dev->hard_start_xmit返回NETDEV_TX_OK则发送成功，成功的时候不会立刻free sk_buff，而是让下半区来进行free操作
+2.5.如果dev->hard_start_xmit没有返回NETDEV_TX_OK，则数据包会走类似2.1中失败的逻辑，等待软中断进行处理
+
+下面来看下对于发包，软中断做了什么，主要是两件事情：
+1.如果因为某种原因当前不能立刻发送这个包，则调用__netif_schedule/netif_schedule，后者会将这个net_device放到output_queue中等待软中断来发送数据包，并且同时也会将这个数据包重新requeue到qdisc的队列中
+2.释放发送成功的包的sk_buff结构体
+
+另外这里可以看到qdisc存在下面三个操作：
+enqueue：dev_queue_xmit在调用qdisc_run之前将上层传来的这个包放到qdisc的队列中，qdisc有自己的很复杂的方法对这些包进行整流
+dequeue：qdisc_run/qdisc_restart从qdisc队列中取出根据qdisc算法获取到的要被发送的数据包
+requeue：如果设备忙或者其它原因使得dev_queue_xmit的调用不能立刻将包发送出去，则需要让软中断继续负责发送。此时需要将这个包重新放到qdisc的队列中，这个操作由requeue完成
+
+可以看到，对于NET_TX_SOFTIRQ，如果数据包一直无法立刻发送，那么其会被不停的触发，如果NET_TX_SOFTIRQ很高，可能意味着这个包在不停的requeue到qdisc中。
+
+另外来看下对于不适用qdisc的设备其发送逻辑。比如对于lookback，其不使用qdisc，所以其发送方法loopback_xmit会的在最后直接调用netif_rx，后者在之前的文章里讲过，会将数据包加到softnet_data的输入队列中，并将lookback设备放到poll_list中，然后接收的软中断会的处理这个数据包：
+[code lang='c']
+    if (q->enqueue) {
+        rc = __dev_xmit_skb(skb, q, dev, txq);
+        goto out; 
+    }    
+
+    /* The device has no queue. Common case for software devices:
+       loopback, all the sorts of tunnels...
+
+       Really, it is unlikely that netif_tx_lock protection is necessary
+       here.  (f.e. loopback and IP tunnels are clean ignoring statistics
+       counters.)
+       However, it is possible, that they rely on protection
+       made by us here.
+
+       Check this and shot the lock. It is not prone from deadlocks.
+       Either shot noqueue qdisc, it is even simpler 8)
+     */
+......
+static const struct net_device_ops loopback_ops = {
+    .ndo_init      = loopback_dev_init,
+    .ndo_start_xmit= loopback_xmit,
+    .ndo_get_stats64 = loopback_get_stats64,
+    .ndo_set_mac_address = eth_mac_addr,
+};
+......
+/*
+ * The higher levels take care of making this non-reentrant (it's
+ * called with bh's disabled).
+ */
+static netdev_tx_t loopback_xmit(struct sk_buff *skb,
+                 struct net_device *dev)
+{
+    struct pcpu_lstats *lb_stats;
+    int len;
+
+    skb_orphan(skb);
+
+    /* Before queueing this packet to netif_rx(),
+     * make sure dst is refcounted.
+     */
+    skb_dst_force(skb);
+
+    skb->protocol = eth_type_trans(skb, dev);
+
+    /* it's OK to use per_cpu_ptr() because BHs are off */
+    lb_stats = this_cpu_ptr(dev->lstats);
+
+    len = skb->len;
+    if (likely(netif_rx(skb) == NET_RX_SUCCESS)) {
+        u64_stats_update_begin(&lb_stats->syncp);
+        lb_stats->bytes += len;
+        lb_stats->packets++;
+        u64_stats_update_end(&lb_stats->syncp);
+    }   
+
+    return NETDEV_TX_OK;
+}
+[/code]
