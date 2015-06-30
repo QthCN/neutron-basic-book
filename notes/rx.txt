@@ -88,5 +88,5 @@ netif_poll_disable/netif_poll_enable：net_device在被加入到poll_list之前�
 process_backlog：non-NAPI默认的poll方法
 netif_receive_skb：poll方法中，让数据包开始协议栈处理的入口函数。无论是non-NAPI还是NAPI都是通过这个函数传递sk_buff，然后通过协议栈处理这个sk_buff的。
 
-
+对于收包，如果是中断产生的，那么设置好软中断则中断上半区就结束了。如果是内核其它部分直接调用产生的，并且调用的是类似NAPI的poll等方法，则调用在设置好软中断后也会返回。如果是直接调用软中断内的函数实现的（如bridge在转发local口时候调用的netif_receive_skb_sk），则会等待函数执行完成（如copy后等待上层tcp层的应用处理）才会返回。
 

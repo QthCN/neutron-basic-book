@@ -88,3 +88,5 @@ static netdev_tx_t loopback_xmit(struct sk_buff *skb,
     return NETDEV_TX_OK;
 }
 [/code]
+
+对于发包：如果一次性就能顺利发送，那么调用直接返回成功。否则会走下半区，因此调用也会返回成功。
