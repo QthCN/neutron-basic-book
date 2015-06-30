@@ -1,0 +1,123 @@
+这篇文章来分析下veth的实现，veth在neutron中用的主要是br-int和linux bridge的连接，还算是用的挺多的。不过性能不怎么好。
+
+源码文件就一个：drivers/net/veth.c
+
+首先当然从module_init来看啦，对应的函数为veth_init，代码：
+[code lang="c"]
+static __init int veth_init(void)
+{
+    return rtnl_link_register(&veth_link_ops);
+}
+......
+static struct rtnl_link_ops veth_link_ops = {
+    .kind       = DRV_NAME,
+    .priv_size  = sizeof(struct veth_priv),
+    .setup      = veth_setup,
+    .validate   = veth_validate,
+    .newlink    = veth_newlink,
+    .dellink    = veth_dellink,
+    .policy     = veth_policy,
+    .maxtype    = VETH_INFO_MAX,
+    .get_link_net   = veth_get_link_net,
+};
+[/code]
+
+netlink的东西太复杂了，我们的分析很简单，关注怎么收包、怎么发包就行。所以相关的net_device对应的ops为：
+[code lang="c"]
+static const struct net_device_ops veth_netdev_ops = { 
+    .ndo_init            = veth_dev_init,
+    .ndo_open            = veth_open,
+    .ndo_stop            = veth_close,
+    .ndo_start_xmit      = veth_xmit,
+    .ndo_change_mtu      = veth_change_mtu,
+    .ndo_get_stats64     = veth_get_stats64,
+    .ndo_set_rx_mode     = veth_set_multicast_list,
+    .ndo_set_mac_address = eth_mac_addr,
+#ifdef CONFIG_NET_POLL_CONTROLLER
+    .ndo_poll_controller    = veth_poll_controller,
+#endif
+    .ndo_get_iflink     = veth_get_iflink,
+};
+[/code]
+对于收包我们都知道是内核统一的，对于发包函数为veth_xmit。实现为：
+[code lang="c"]
+static netdev_tx_t veth_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+    struct veth_priv *priv = netdev_priv(dev);
+    struct net_device *rcv;
+    int length = skb->len;
+
+    rcu_read_lock();
+    rcv = rcu_dereference(priv->peer);
+    if (unlikely(!rcv)) {
+        kfree_skb(skb);
+        goto drop;
+    }
+    /* don't change ip_summed == CHECKSUM_PARTIAL, as that
+     * will cause bad checksum on forwarded packets
+     */
+    if (skb->ip_summed == CHECKSUM_NONE &&
+        rcv->features & NETIF_F_RXCSUM)
+        skb->ip_summed = CHECKSUM_UNNECESSARY;
+
+    if (likely(dev_forward_skb(rcv, skb) == NET_RX_SUCCESS)) {
+        struct pcpu_vstats *stats = this_cpu_ptr(dev->vstats);
+
+        u64_stats_update_begin(&stats->syncp);
+        stats->bytes += length;
+        stats->packets++;
+        u64_stats_update_end(&stats->syncp);
+    } else {
+drop:
+        atomic64_inc(&priv->dropped);
+    }
+    rcu_read_unlock();
+    return NETDEV_TX_OK;
+}
+[/code]
+可以看到发包就是调用dev_forward_skb进行转发：
+[code lang="c"]
+/**
+ * dev_forward_skb - loopback an skb to another netif
+ *  
+ * @dev: destination network device
+ * @skb: buffer to forward
+ *
+ * return values:
+ *  NET_RX_SUCCESS  (no congestion)
+ *  NET_RX_DROP     (packet was dropped, but freed)
+ *
+ * dev_forward_skb can be used for injecting an skb from the
+ * start_xmit function of one device into the receive queue
+ * of another device.
+ *
+ * The receiving device may be in another namespace, so
+ * we have to clear all information in the skb that could
+ * impact namespace isolation.
+ */
+int dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
+{
+    return __dev_forward_skb(dev, skb) ?: netif_rx_internal(skb);
+}
+EXPORT_SYMBOL_GPL(dev_forward_skb);
+[/code]
+那么转发给谁呢？转发给rcv，也就是priv->peer，即veth的peer设备。
+
+再来看下收包，我们知道对于NAPI收包会走poll，由于veth的net_device没有实现poll，所以我们可以认为其走的就是默认的poll。
+
+最后我们来看下veth的net_device是如何存放收到的包的。dev_forward_skb会调用netif_rx_internal，后者存在如下代码：
+[code lang="c"]
+    {    
+        unsigned int qtail;
+        ret = enqueue_to_backlog(skb, get_cpu(), &qtail);
+        put_cpu();
+    }  
+[/code]
+这里就很熟悉了，其会将包放到CPU的softnet_data的input_pkt_queue上，然后调用软中断进行处理。软中断调用poll，poll对于veth则是默认的内核实现。所以一个包到了veth的一个口后，如果某个锁被占用，那么调用至少一次软中断进行发送。发送成功后这个包给另一头，另一头也会调用一次软中断进行接收。小秦我觉得另一头的接收的那次软中断或许可以想办法减掉。另外对于veth目前的实现，只能走但队列了。不过或许能支持RPS？
+
+因此，veth的实现其实和lo差不多，只不过数据包是抓发给了priv->peer而不是直接给了自己。
+
+另外在http://flavioleitner.blogspot.com.br/这篇文章中提到了veth默认只有1000个packet的queue，这个1000是哪里来的呢？就是input_pkt_queue的默认值咯：
+[code lang="c"]
+int netdev_max_backlog __read_mostly = 1000;
+[/code]
