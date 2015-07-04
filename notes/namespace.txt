@@ -1,0 +1,525 @@
+我们都知道Neutron中的路由器默认是建立在独立的namespace中的，这里就来看下namespace在linux中的实现。主要还是针对网络部分的namespace，同时只关注二层。
+
+首先我们先看下内核中和namespace相关的结构体，然后我们来看下ip netns这个命令是如何实现的。
+
+内核中namespace都是在task_struct的nsproxy结构体中的：
+[code lang='c']
+/* namespaces */
+    struct nsproxy *nsproxy;
+[/code]
+[code alng='c']
+/*  
+ * A structure to contain pointers to all per-process
+ * namespaces - fs (mount), uts, network, sysvipc, etc.
+ *
+ * The pid namespace is an exception -- it's accessed using
+ * task_active_pid_ns.  The pid namespace here is the
+ * namespace that children will use.
+ *
+ * 'count' is the number of tasks holding a reference.
+ * The count for each namespace, then, will be the number
+ * of nsproxies pointing to it, not the number of tasks.
+ *  
+ * The nsproxy is shared by tasks which share all namespaces.
+ * As soon as a single namespace is cloned or unshared, the
+ * nsproxy is copied.
+ */ 
+struct nsproxy {
+    atomic_t count;
+    struct uts_namespace *uts_ns;
+    struct ipc_namespace *ipc_ns;
+    struct mnt_namespace *mnt_ns;
+    struct pid_namespace *pid_ns_for_children;
+    struct net       *net_ns;
+};
+extern struct nsproxy init_nsproxy;
+[/code]
+
+对于网络，我们关注net_ns。net这个结构体在include/net/net_namespace.h文件中。下面是比较重要的属性：
+[code lang='c']
+struct net {
+    ...
+    //namespace的链表
+    struct list_head    list;  
+    //用来串net_device的链表     
+    struct list_head    dev_base_head;
+    struct hlist_head   *dev_name_head;
+    struct hlist_head   *dev_index_head;
+    //每个namespace自己的lo折本链表
+    struct net_device       *loopback_dev;
+    ...
+};
+[/code]
+从上面的结构体我们可以知道namespace是和进程相关的（因为nsproxy是task_struct的属性），所以在看ip的代码前，我们猜测下建立一个namespace X会发生什么：
+1.生成一个net结构体
+2.当某个进程切换到X这个网络的namespace的时候，其nsproxy中的net_ns指向这个net结构体
+3.其后的操作，比如ip l show这类命令，会根据net_ns的net结构体来查看显示对应的net_device（也就是查dev_base_head）
+
+上面的第三点如果根据《深入Linux内核架构》中来说，就是“网络子系统实现的所有全局函数，都需要一个网络命名空间作为参数，而网络子系统的所有全局属性，只能通过所述命名空间迂回访问”。比如我们的net_device就是一个全局属性，访问的时候就得走网络的namespace。
+
+来看下ip中的netns相关的代码实现吧，不从这个入手的话真不知道这么多内核代码该怎么看了：）
+
+来看代码，入口为do_netns：
+[code lang="c"]
+    if (matches(*argv, "add") == 0)
+        return netns_add(argc-1, argv+1);
+[/code]
+netns_add处理namespace的增加操作。实现为：
+[code lang="c"]
+static int netns_add(int argc, char **argv)
+{
+    /* This function creates a new network namespace and
+     * a new mount namespace and bind them into a well known
+     * location in the filesystem based on the name provided.
+     * 
+     * The mount namespace is created so that any necessary
+     * userspace tweaks like remounting /sys, or bind mounting
+     * a new /etc/resolv.conf can be shared between uers.
+     */ 
+    char netns_path[MAXPATHLEN];
+    const char *name;
+    int fd;
+    int made_netns_run_dir_mount = 0;
+    
+    if (argc < 1) {
+        fprintf(stderr, "No netns name specified\n");
+        return -1;
+    }   
+    name = argv[0];
+
+    snprintf(netns_path, sizeof(netns_path), "%s/%s", NETNS_RUN_DIR, name);
+
+    if (create_netns_dir())
+        return -1;
+[/code]
+首先可以看到，如果建立一个net的ns，会的在NETNS_RUN_DIR下建立一个目录，NETNS_RUN_DIR为：
+[code lang="c"]
+#define NETNS_RUN_DIR "/var/run/netns"
+[/code]
+比如这个例子：
+[code lang='c']
+[root@dev ~]# ip netns add X
+[root@dev ~]# cd /var/run/netns/
+[root@dev netns]# ll
+总用量 0
+-r--r--r--. 1 root root 0 7月   4 21:11 X
+[/code]
+我们可以看到X被建立了出来。
+
+接下来的代码涉及到和mount的联动，这个我们不太关心（比如可以看到有个proc挂在了上面），所以继续看下面的代码：
+[code lang='c']
+    /* Create the filesystem state */
+    fd = open(netns_path, O_RDONLY|O_CREAT|O_EXCL, 0);
+    if (fd < 0) {
+        fprintf(stderr, "Cannot create namespace file \"%s\": %s\n",
+            netns_path, strerror(errno));
+        return -1;
+    }
+    close(fd);
+    if (unshare(CLONE_NEWNET) < 0) {
+        fprintf(stderr, "Failed to create a new network namespace \"%s\": %s\n",
+            name, strerror(errno));
+        goto out_delete;
+    }
+[/code]
+这里我们的X目录就建立了，unshare的作用根据man文档的说明，就是建立我们的网络的namespace（作用和clone类似，但是不需要真的弄一个新进程出来）。根据man文档：
+
+CLONE_NEWNET (since Linux 2.6.24)
+       This flag has the same effect as the clone(2) CLONE_NEWNET
+       flag.  Unshare the network namespace, so that the calling
+       process is moved into a new network namespace which is not
+       shared with any previously existing process.  Use of
+       CLONE_NEWNET requires the CAP_SYS_ADMIN capability.
+
+我们知道namespace是task_struct的一个结构体，当一个进程fork一个新的进程的时候(fork和clone功能上在这里可以看成是一样的)，task_struct会由clone负责生成，因此namespace也就和clone相关了。如果clone说：“hey，来个新的namespace吧”，那么clone是有能力做到这一点的，做的方法也不难，只要给task_struct的nsproxy赋予相应的结构体就行。unshare根据文档，只是避免了建立一个新的task_struct，在现有的task_struct中改动罢了。从这个角度再来看我们的namespace的话，可以看到如下的场景：
+1.系统启动，大家共用一个公共的网络namespace。所以大家的task_struct->nsproxy->net_ns都是指向了默认的namespace，比如DEFAULT_NETNS
+2.某个进程（一般是bash进程）想玩点花样，于是想通过unshare建立了一个新的namespace X。于是在bash中有人敲入了ip netns add X的命令。但是注意，这个命令虽然被敲下了，但是真正执行这个命令的不是bash，而是ip。bash fork出了ip，ip执行相应命令，所以ip的task_struct->nsproxy->net_ns会指向新的net_ns，也就是X，但是bash依旧是默认的，在我们这里就是DEFAULT_NETNS。
+
+至于默认的namespace被创建的时候做了什么事情，我们下面会根据clone的代码来看。现在有个疑问，为什么ip netns list看不到DEFAULT_NETNS呢？来看下ip netns list的实现吧：
+[code lang="c"]
+static int netns_list(int argc, char **argv)
+{
+    struct dirent *entry;
+    DIR *dir;
+    int id;
+    
+    dir = opendir(NETNS_RUN_DIR);
+    if (!dir)
+        return 0;
+        
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0)
+            continue;
+        if (strcmp(entry->d_name, "..") == 0)
+            continue;
+        printf("%s", entry->d_name);
+        if (ipnetns_have_nsid()) {
+            id = get_netnsid_from_name(entry->d_name);
+            if (id >= 0)
+                printf(" (id: %d)", id);
+        }
+        printf("\n");
+    }
+    closedir(dir);
+    return 0;
+}
+[/code]
+可以看到，ip netns list只会显示通过ip netns add命令创建了目录的那些namespace......
+
+关于ip命令，最后再来看下ip netns exec：
+[code lang="c"]
+static int netns_exec(int argc, char **argv)
+{   
+    /* Setup the proper environment for apps that are not netns
+     * aware, and execute a program in that environment.
+     */
+    const char *cmd;
+
+    if (argc < 1 && !do_all) { 
+        fprintf(stderr, "No netns name specified\n");
+        return -1;
+    }
+    if ((argc < 2 && !do_all) || (argc < 1 && do_all)) {
+        fprintf(stderr, "No command specified\n");
+        return -1;
+    }   
+
+    if (do_all)
+        return do_each_netns(on_netns_exec, --argv, 1);
+
+    if (netns_switch(argv[0]))
+        return -1;
+
+    /* ip must return the status of the child,
+     * but do_cmd() will add a minus to this,
+     * so let's add another one here to cancel it.
+     */
+    cmd = argv[1];
+    return -cmd_exec(cmd, argv + 1, !!batch_mode);
+}
+[/code]
+从函数名看关键的代码应该是netns_switch，其切换了bash生成的ip进程的namespace上下文，核心代码为：
+[code lang='c']
+    snprintf(net_path, sizeof(net_path), "%s/%s", NETNS_RUN_DIR, name);
+    netns = open(net_path, O_RDONLY | O_CLOEXEC);
+    if (netns < 0) {
+        fprintf(stderr, "Cannot open network namespace \"%s\": %s\n",
+            name, strerror(errno));
+        return -1;
+    }
+    if (setns(netns, CLONE_NEWNET) < 0) {
+        fprintf(stderr, "setting the network namespace \"%s\" failed: %s\n",
+            name, strerror(errno));
+        return -1;
+    }
+
+    if (unshare(CLONE_NEWNS) < 0) {
+        fprintf(stderr, "unshare failed: %s\n", strerror(errno));
+        return -1;
+    }
+[/code]
+首先会先去我们的NETNS_RUN_DIR目录看下我们的文件在不在，不在的话就会报namespace无法打开的错误。下面的unshare我们上面说过了，就是让当前的进程使用一个新的namespace，那么setns是做什么的呢？根据名字它应该就是设置我们真正要使用哪个namespace。看下man吧：
+
+       Given a file descriptor referring to a namespace, reassociate the
+       calling thread with that namespace.
+
+       The fd argument is a file descriptor referring to one of the
+       namespace entries in a /proc/[pid]/ns/ directory; see namespaces(7)
+       for further information on /proc/[pid]/ns/.  The calling thread will
+       be reassociated with the corresponding namespace, subject to any
+       constraints imposed by the nstype argument.
+
+这里有个问题，如果安装man，setns就已经让进程使用了新的ns了，为什么还要调用unshare呢？可以注意到这里的unshare的flag是CLONE_NEWNS，而不是add中的CLONE_NEWNET。CLONE_NEWNS这个从man可以看到是和mount的namespace有关的，所以我们就不去看了。
+
+另外从setns中可以看到上面创建的目录其实是需要一个proc下的fd才行，这部分代码我们在看add的代码的时候跳过了，有兴趣的大家可以看下：
+[code lang='c']
+    /* Bind the netns last so I can watch for it */
+    if (mount("/proc/self/ns/net", netns_path, "none", MS_BIND, NULL) < 0) {
+        fprintf(stderr, "Bind /proc/self/ns/net -> %s failed: %s\n",
+            netns_path, strerror(errno));
+        goto out_delete;
+    }
+[/code]
+
+比如默认进程的/proc/self/ns/net下的fd为：
+[code lang='bash']
+[root@dev netns]# ls -l /proc/1/ns/net 
+lrwxrwxrwx. 1 root root 0 7月   4 22:02 /proc/1/ns/net -> net:[4026531956]
+[root@dev netns]# ls -l /proc/self/ns/net 
+lrwxrwxrwx. 1 root root 0 7月   4 22:04 /proc/self/ns/net -> net:[4026531956]
+[/code]
+我们启动一个使用X这个网络namespace的进程，然后看下其proc的内容：
+[code lang='bash']
+#第一个窗口执行下面命令
+[root@dev netns]# ip netns exec X top
+#第二个窗口进行查看
+[root@dev ~]# ps -elf | grep top
+4 S root      7097  6117  0  80   0 - 32506 poll_s 22:04 pts/0    00:00:00 top
+0 S root      7110  6829  0  80   0 - 28164 pipe_w 22:05 pts/1    00:00:00 grep --color=auto top
+[root@dev ~]# ls -l /proc/7097/ns/net 
+lrwxrwxrwx. 1 root root 0 7月   4 22:05 /proc/7097/ns/net -> net:[4026532163]
+[/code]
+可以看到，默认的网络的namespace是4026531956，而X的则是4026532163。不难猜测，proc在内核中肯定是指导了我们的struct net上，其实如果仔细看struct net会发现其中有很多proc相关的属性。
+
+下面来看下clone中和网络部分namespace有关的代码，入口为其底层实现的do_fork中的copy_process下的：
+[code lang='c']
+    retval = copy_namespaces(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_mm;
+[/code]
+实现为：
+[code lang="c"]
+int copy_namespaces(unsigned long flags, struct task_struct *tsk)
+{   
+    struct nsproxy *old_ns = tsk->nsproxy;
+    struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+    struct nsproxy *new_ns;
+        
+    if (likely(!(flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
+                  CLONE_NEWPID | CLONE_NEWNET)))) {
+        get_nsproxy(old_ns);
+        return 0;
+    }
+        
+    if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+        return -EPERM;
+            
+    /*  
+     * CLONE_NEWIPC must detach from the undolist: after switching
+     * to a new ipc namespace, the semaphore arrays from the old
+     * namespace are unreachable.  In clone parlance, CLONE_SYSVSEM
+     * means share undolist with parent, so we must forbid using
+     * it along with CLONE_NEWIPC.
+     */
+    if ((flags & (CLONE_NEWIPC | CLONE_SYSVSEM)) ==
+        (CLONE_NEWIPC | CLONE_SYSVSEM))
+        return -EINVAL;
+
+    new_ns = create_new_namespaces(flags, tsk, user_ns, tsk->fs);
+    if (IS_ERR(new_ns))
+        return  PTR_ERR(new_ns);
+
+    tsk->nsproxy = new_ns;
+    return 0;
+}
+[/code]
+这里代码先是检查了下flag，然后看下是不是CAP_SYS_ADMIN权限，然后执行create_new_namespaces来真正干活。来看下create_new_namespaces：
+[code lang='c']
+/*
+ * Create new nsproxy and all of its the associated namespaces.
+ * Return the newly created nsproxy.  Do not attach this to the task,
+ * leave it to the caller to do proper locking and attach it to task.
+ */
+static struct nsproxy *create_new_namespaces(unsigned long flags,
+    struct task_struct *tsk, struct user_namespace *user_ns,
+    struct fs_struct *new_fs)
+{
+    struct nsproxy *new_nsp;
+    int err;
+        
+    new_nsp = create_nsproxy();
+    if (!new_nsp)
+        return ERR_PTR(-ENOMEM);
+[/code]
+首先是建立一个新的create_nsproxy，实现为：
+[code lang='c']
+static inline struct nsproxy *create_nsproxy(void)
+{
+    struct nsproxy *nsproxy;
+
+    nsproxy = kmem_cache_alloc(nsproxy_cachep, GFP_KERNEL);
+    if (nsproxy)
+        atomic_set(&nsproxy->count, 1);
+    return nsproxy;
+}
+[/code]
+可以看到就是分配了块内存，所以可以认为这块内存是全新的。然后我们看下和网络相关的：
+[code lang='c']
+    new_nsp->net_ns = copy_net_ns(flags, user_ns, tsk->nsproxy->net_ns);
+    if (IS_ERR(new_nsp->net_ns)) {
+        err = PTR_ERR(new_nsp->net_ns);
+        goto out_net;
+    }
+[/code]
+[code lang='c']
+struct net *copy_net_ns(unsigned long flags,
+            struct user_namespace *user_ns, struct net *old_net)
+{   
+    struct net *net;
+    int rv;
+    
+    if (!(flags & CLONE_NEWNET))
+        return get_net(old_net);
+    
+    net = net_alloc();
+    if (!net)
+        return ERR_PTR(-ENOMEM);
+
+    get_user_ns(user_ns);
+
+    mutex_lock(&net_mutex);
+    rv = setup_net(net, user_ns);
+    if (rv == 0) {
+        rtnl_lock();
+        list_add_tail_rcu(&net->list, &net_namespace_list);
+        rtnl_unlock();
+    }
+    mutex_unlock(&net_mutex);
+    if (rv < 0) {
+        put_user_ns(user_ns);
+        net_drop_ns(net);
+        return ERR_PTR(rv);
+    }
+    return net;
+}
+[/code]
+这里代码很清楚，如果CLONE_NEWNET没有设置，那么就用老的网络的namespace（也就是新的进程继承老的进程的namespace，你老的能看到几个网卡我新的同样能看到，因为我们都是指向同一个结构体）。否则则是先调用net_alloc获取个新的net结构体，然后通过setup_net初始化后将它放到内核全局的net_namespace_list链表下：
+[code lang='c']
+LIST_HEAD(net_namespace_list);
+EXPORT_SYMBOL_GPL(net_namespace_list);
+[/code]
+
+重点看下setup_net：
+[code lang='c']
+/*
+ * setup_net runs the initializers for the network namespace object.
+ */
+static __net_init int setup_net(struct net *net, struct user_namespace *user_ns)
+{
+    /* Must be called with net_mutex held */
+    const struct pernet_operations *ops, *saved_ops;
+    int error = 0;
+    LIST_HEAD(net_exit_list);
+        
+    atomic_set(&net->count, 1);
+    atomic_set(&net->passive, 1);
+    net->dev_base_seq = 1;
+    net->user_ns = user_ns;
+    idr_init(&net->netns_ids);
+
+    list_for_each_entry(ops, &pernet_list, list) {
+        error = ops_init(ops, net);
+        if (error < 0)
+            goto out_undo;
+    }
+out:
+    return error;
+
+out_undo:
+    /* Walk through the list backwards calling the exit functions
+     * for the pernet modules whose init functions did not fail.
+     */
+    list_add(&net->exit_list, &net_exit_list);
+    saved_ops = ops;
+    list_for_each_entry_continue_reverse(ops, &pernet_list, list)
+        ops_exit_list(ops, &net_exit_list);
+
+    ops = saved_ops;
+    list_for_each_entry_continue_reverse(ops, &pernet_list, list)
+        ops_free_list(ops, &net_exit_list);
+
+    rcu_barrier();
+    goto out;
+}
+[/code]
+可以看到这里主要是调用了pernet_list的ops来执行各种初始化。那么parent_list是哪里来的呢？grep下代码后可以看到：
+[code lang='c']
+/**
+ *      register_pernet_device - register a network namespace device
+ *  @ops:  pernet operations structure for the subsystem
+ *
+ *  Register a device which has init and exit functions
+ *  that are called when network namespaces are created and
+ *  destroyed respectively.
+ *
+ *  When registered all network namespace init functions are
+ *  called for every existing network namespace.  Allowing kernel
+ *  modules to have a race free view of the set of network namespaces.
+ *
+ *  When a new network namespace is created all of the init
+ *  methods are called in the order in which they were registered.
+ *
+ *  When a network namespace is destroyed all of the exit methods
+ *  are called in the reverse of the order with which they were
+ *  registered.
+ */
+int register_pernet_device(struct pernet_operations *ops)
+{
+    int error;
+    mutex_lock(&net_mutex);
+    error = register_pernet_operations(&pernet_list, ops);
+    if (!error && (first_device == &pernet_list))
+        first_device = &ops->list;
+    mutex_unlock(&net_mutex);
+    return error;
+}
+EXPORT_SYMBOL_GPL(register_pernet_device);
+[/code]
+看来只要是对namespace有兴趣的，调用register_pernet_device注册后就都能在一个网络的namespace被建立的时候给调用下。我们来看下./net/core/dev.c这个，在net_dev_init中可以看到：
+[code lang='c']
+    /* The loopback device is special if any other network devices
+     * is present in a network namespace the loopback device must
+     * be present. Since we now dynamically allocate and free the
+     * loopback device ensure this invariant is maintained by
+     * keeping the loopback device as the first device on the
+     * list of network devices.  Ensuring the loopback devices
+     * is the first device that appears and the last network device
+     * that disappears.
+     */
+    if (register_pernet_device(&loopback_net_ops))
+        goto out; 
+
+    if (register_pernet_device(&default_device_ops))
+        goto out; 
+[/code]
+根据小秦之前的文章，我们知道net_dev_init是用于系统启动的时候网络子系统初始化相关的入口函数。根据这里的注释我们知道为了保证每个网络的namepsace下面都有lo设备，所以这里调用了register_pernet_device注册了loopback_net_ops这个方法。来看下其init这个函数指针的实现：
+[code lang='c']
+/* Setup and register the loopback device. */
+static __net_init int loopback_net_init(struct net *net)
+{       
+    struct net_device *dev;
+    int err;
+    
+    err = -ENOMEM;
+    dev = alloc_netdev(0, "lo", NET_NAME_UNKNOWN, loopback_setup);
+    if (!dev)
+        goto out;
+
+    dev_net_set(dev, net);
+    err = register_netdev(dev);
+    if (err)
+        goto out_free_netdev;
+
+    BUG_ON(dev->ifindex != LOOPBACK_IFINDEX);
+    net->loopback_dev = dev;
+    return 0;
+    
+        
+out_free_netdev:
+    free_netdev(dev);
+out:
+    if (net_eq(net, &init_net))
+        panic("loopback: Failed to register netdevice: %d\n", err);
+    return err;
+} 
+[/code]
+alloc_netdev、register_netdev我们很熟悉了，在小秦之前的文章中重点看了下其实现。这里注意下dev_net_set，因为其有个net参数，这个是我们的net的namespace结构体。实现为：
+[code lang='c']
+static inline
+void dev_net_set(struct net_device *dev, struct net *net)
+{
+    write_pnet(&dev->nd_net, net);
+}
+static inline void write_pnet(possible_net_t *pnet, struct net *net)
+{
+#ifdef CONFIG_NET_NS
+    pnet->net = net;
+#endif
+}
+[/code]
+可以看到我们的net_device结构体中，也有一个用于存放net的地方，这样很多事情就好办了，比如我想看下某个namespace下有哪些net_device，虽然我们上面说了net结构体里有net_device的链表，但我们同样可以遍历大的net_device链表，根据其nd_net->net来查看其是否属于这个namespace。
+
+虽然小秦这里并没有分析的太多，但是从目前可以看到的代码来说，相比要实现一个完整的网络的namespace是要改很多东西的。比如bridge，转发的port应该也会涉及到相应的操作。
+
+
+
