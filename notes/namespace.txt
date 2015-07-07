@@ -521,5 +521,20 @@ static inline void write_pnet(possible_net_t *pnet, struct net *net)
 
 虽然小秦这里并没有分析的太多，但是从目前可以看到的代码来说，相比要实现一个完整的网络的namespace是要改很多东西的。比如bridge，转发的port应该也会涉及到相应的操作。
 
+另外我们知道网络的namespace是我们的net结构体，如果系统的某个组件需要做到网络namespace感知，那么在net下必然要存放这个组件相关的私有数据。最近遇到一个问题，比如物理机上的系统变量ip_forward改变了，但是namespace里的没变，这个事情在我们的net结构体中就能找到答案，因为net结构体里有sysctl相关的结构体。比如：
+[code lang='c']
+struct netns_ipv4   ipv4;
+[/code]
+[code lang='c']
+struct netns_ipv4 {
+#ifdef CONFIG_SYSCTL
+    struct ctl_table_header *forw_hdr;
+    struct ctl_table_header *frags_hdr;
+    struct ctl_table_header *ipv4_hdr;
+    struct ctl_table_header *route_hdr;
+    struct ctl_table_header *xfrm4_hdr;
+#endif
+[/code]
+换句话说，如果对内核中的结构体足够熟悉，想要知道内核已经让哪些组件支持网络的namespace的话，查看我们的net结构体就基本上能清楚了。
 
 
