@@ -95,7 +95,7 @@
         lo/veth的实现    # 一期完成
         多队列/RPS
         GSO/LSO...
-    5.3namespace的实现
+    5.3网络namespace的实现
     5.4Linux Bridge的实现
     5.5OVS的实现
 第六章 SDN
