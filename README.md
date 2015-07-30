@@ -88,15 +88,14 @@
         硬件中断&module机制    # 一期完成
         softirq    # 一期完成
         proc文件系统    # 一期完成
-    5.2协议栈中的收包/发包
+    5.2协议栈中的收包/发包  # 一期完成
         PCIe设备驱动的加载    # 一期完成
         收包路径    # 一期完成
         发包路径    # 一期完成
         lo/veth的实现    # 一期完成
-        多队列/RSS/RPS/RFS
-        TSO/GSO/LRO/GRO
-        DPDK
-        ......
+        多队列/RSS/RPS/RFS  # 一期完成
+        LSO/LRO/GSO/GRO/TSO/USO # 一期完成
+        DPDK    # 一期完成
     5.3网络namespace的实现 # 一期完成
     5.4Linux Bridge的实现
     5.5OVS的实现
