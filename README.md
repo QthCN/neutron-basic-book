@@ -94,7 +94,9 @@
         发包路径    # 一期完成
         lo/veth的实现    # 一期完成
         多队列/RPS
-        GSO/LSO...
+        GSO/LSO
+        DPDK
+        ......
     5.3网络namespace的实现 # 一期完成
     5.4Linux Bridge的实现
     5.5OVS的实现
