@@ -93,7 +93,7 @@
         收包路径    # 一期完成
         发包路径    # 一期完成
         lo/veth的实现    # 一期完成
-        多队列/RPS
+        多队列/RSS/RPS/RFS
         GSO/LSO
         DPDK
         ......
