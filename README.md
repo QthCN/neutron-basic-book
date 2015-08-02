@@ -101,7 +101,7 @@
     5.5OVS的实现
 第六章 SDN
 第七章 容器中的网络
-    容器 or 虚拟化？
+    容器 or 传统虚拟化？    # 一期完成
     Docker
     Kubernetes
     libnetwork
