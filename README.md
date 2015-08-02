@@ -97,7 +97,7 @@
         LSO/LRO/GSO/GRO/TSO/USO # 一期完成
         DPDK    # 一期完成
     5.3网络namespace的实现 # 一期完成
-    5.4Linux Bridge的实现
+    5.4Linux Bridge的实现   # 一期完成
     5.5OVS的实现
 第六章 SDN
 第七章 容器中的网络
