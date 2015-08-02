@@ -102,7 +102,7 @@
 第六章 SDN
 第七章 容器中的网络
     容器 or 传统虚拟化？    # 一期完成
-    Docker
+    Docker  # 一期完成
     Kubernetes
     libnetwork
     Neutron与容器
