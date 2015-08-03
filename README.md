@@ -103,7 +103,7 @@
 第七章 容器中的网络
     容器 or 传统虚拟化？    # 一期完成
     Docker  # 一期完成
-    Kubernetes
+    Kubernetes  # 一期完成
     libnetwork
     Neutron与容器
 第八章 后记
