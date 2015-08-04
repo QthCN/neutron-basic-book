@@ -31,20 +31,15 @@
 ```
 第一章 本书介绍
 第二章 Neutron的部署、运维、高可用
-    基础网络知识
-        CCNP
-        大学网络基础课的知识
-        常用命令（ip/iptables/tc & qdisc/tcpdump/route/brctl/veth）
-        namespace
-        ovs简介及常用命令
-        libvirt中的网络
-    Neutron的部署
-        从源码部署
-        实际环境的部署
-        日常维护、监控项
-        高可用（各个组件高可用探讨、部署方法）
-        安全
-        升级
+    常用命令（ip/iptables/tc & qdisc/tcpdump/route/brctl/veth）
+    namespace简介及用法
+    ovs简介及常用命令
+    libvirt/qemu中的网络
+    Neutron部署
+    Neutron日常维护及监控
+    Neutron高可用（各个组件高可用探讨、部署方法）
+    Neutron安全
+    Neutron升级
 第三章 Neutron实现
     开发环境的搭建
     如何共享代码
