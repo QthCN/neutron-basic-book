@@ -100,12 +100,12 @@
     5.4Linux Bridge的实现   # 一期完成
     5.5OVS的实现
 第六章 SDN
-第七章 容器中的网络
+第七章 容器中的网络 # 一期完成
     容器 or 传统虚拟化？    # 一期完成
     Docker  # 一期完成
     Kubernetes  # 一期完成
     libnetwork  # 一期完成
-    Neutron与容器
+    Neutron与容器 # 一期完成
 第八章 后记
 ```
 
